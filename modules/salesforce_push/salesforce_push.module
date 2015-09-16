@@ -119,6 +119,7 @@ function salesforce_push_mapping_object_form_submit($form, &$form_state) {
  *   Trigger for this sync.
  */
 function salesforce_push_sync_rest($entity_type, $entity, $mapping, $sf_sync_trigger) {
+  $success = TRUE;
   $sfapi = salesforce_get_api();
 
   // Not authorized, we need to bail this time around.
@@ -196,7 +197,7 @@ function salesforce_push_sync_rest($entity_type, $entity, $mapping, $sf_sync_tri
     catch(SalesforceException $e) {
       watchdog_exception('salesforce_push', $e);
       salesforce_set_message($e->getMessage(), 'error');
-      return;
+      return FALSE;
     }
 
     // Success.
@@ -220,7 +221,7 @@ function salesforce_push_sync_rest($entity_type, $entity, $mapping, $sf_sync_tri
       );
       salesforce_set_message($message, 'error');
       watchdog('salesforce_push', $message);
-      return;
+      return FALSE;
     }
   }
   // Existing object link, update.
@@ -228,7 +229,7 @@ function salesforce_push_sync_rest($entity_type, $entity, $mapping, $sf_sync_tri
     // Handle the case of mapped objects last sync being more recent than
     // the entity's timestamp, which is set by salesforce_mapping.
     if ($mapping_object->last_sync > $mapping_object->entity_updated) {
-      return;
+      return TRUE;
     }
 
     // Update SF object.
@@ -252,12 +253,66 @@ function salesforce_push_sync_rest($entity_type, $entity, $mapping, $sf_sync_tri
       )), 'error');
       $mapping_object->last_sync_message = $e->getMessage();
       $mapping_object->last_sync_status = SALESFORCE_MAPPING_STATUS_ERROR;
+
+      $success = FALSE;
     }
   }
 
   $mapping_object->last_sync_action = 'push';
   $mapping_object->last_sync = REQUEST_TIME;
   $mapping_object->save();
+
+  return $success;
+}
+
+/**
+ * Implements hook_advanced_queue_info().
+ */
+function salesforce_push_advanced_queue_info() {
+  $queues = array();
+
+  // Only tell AdvancedQueue about this queue worker if explicitly defined. This
+  // means that a cache flush is required after this variable is changed.
+  if (variable_get('salesforce_push_queue_method', 'cron') == 'advancedqueue') {
+    $queues[SALESFORCE_PUSH_QUEUE] = array(
+      'label' => t('Salesforce push queue'),
+      'worker_callback' => 'salesforce_push_queue_worker',
+      'retry after' => 60,
+      'max attempts' => 5,
+    );
+  }
+
+  return $queues;
+}
+
+/**
+ * Worker function for salesforce_push queue items processed via Advanced
+ * Queue.
+ */
+function salesforce_push_queue_worker($item) {
+  $sfapi = salesforce_get_api();
+  if (!$sfapi->isAuthorized()) {
+    return ADVANCEDQUEUE_STATUS_FAILURE_RETRY;
+  }
+
+  $mapping = $item->data['mapping'];
+  $entity_type = $item->data['entity_type'];
+  $entity_id = $item->data['entity_id'];
+
+  // Attempt to load our entity from the queue item.
+  $entity = entity_load_single($entity_type, $entity_id);
+
+  // If the entity fails to load, remove it from the queue. This can happen
+  // if we're processing records asynchronously and it was deleted from SF
+  // before cron ran.
+  if ($entity === FALSE) {
+    return ADVANCEDQUEUE_STATUS_FAILURE;
+  }
+
+  $mapping_object = salesforce_mapping_object_load_by_drupal($entity_type, $entity_id);
+  $result = salesforce_push_sync_rest($entity_type, $entity, $mapping, $item->data['trigger']);
+
+  return ($result ? ADVANCEDQUEUE_STATUS_SUCCESS : ADVANCEDQUEUE_STATUS_FAILURE_RETRY);
 }
 
 /**
@@ -266,6 +321,12 @@ function salesforce_push_sync_rest($entity_type, $entity, $mapping, $sf_sync_tri
 function salesforce_push_cron() {
   $sfapi = salesforce_get_api();
   if (!$sfapi->isAuthorized()) {
+    return;
+  }
+  if (variable_get('salesforce_push_queue_method', 'cron') != 'cron') {
+    // Optionally, allow processing via Advanced Queue instead.
+    // @see functions salesforce_push_advanced_queue_info() and
+    // salesforce_push_queue_worker() for details.
     return;
   }
 
